@@ -14,6 +14,7 @@ Required libraries: OpenCV, NumPy
 """
 import cv2
 import numpy as np
+import os
 
 
 def is_grayscale(img):
@@ -68,6 +69,7 @@ def inpaint_spots(img, mask):
     """Inpaint detected spots using Telea method."""
     if mask is None or np.sum(mask) == 0:
         return img
+    # default radius 3 retained if not provided
     inpainted = cv2.inpaint(img, mask, 3, cv2.INPAINT_TELEA)
     return inpainted
 
@@ -130,6 +132,65 @@ def ssim(img1, img2):
 
     ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
     return float(np.mean(ssim_map))
+
+
+def single_scale_retinex(img, sigma):
+    """Single Scale Retinex for a single-channel image."""
+    blur = cv2.GaussianBlur(img, (0, 0), sigma)
+    # avoid log(0)
+    img = img.astype(np.float32) + 1.0
+    blur = blur.astype(np.float32) + 1.0
+    retinex = np.log(img) - np.log(blur)
+    return retinex
+
+
+def multi_scale_retinex(img, scales):
+    """Apply Multi-Scale Retinex to a single-channel image.
+
+    scales: list of sigma values
+    """
+    retinex = np.zeros_like(img, dtype=np.float32)
+    for sigma in scales:
+        retinex += single_scale_retinex(img, sigma)
+    retinex = retinex / float(len(scales))
+    return retinex
+
+
+def msrcr(img, scales=(15, 80, 250), G=192, b=-30, alpha=125, beta=46):
+    """Multi-Scale Retinex with Color Restoration (MSRCR).
+
+    Returns BGR uint8 image.
+    Parameters chosen to be reasonable defaults; they can be tuned.
+    """
+    img = img.astype(np.float32)
+    img = np.clip(img, 1.0, 255.0)
+
+    # split channels in BGR but process on each channel
+    B, Gc, R = cv2.split(img)
+    # compute MSR on each channel
+    msr_B = multi_scale_retinex(B, scales)
+    msr_G = multi_scale_retinex(Gc, scales)
+    msr_R = multi_scale_retinex(R, scales)
+
+    # color restoration factor
+    # avoid division by zero: sum of channels
+    sum_channels = (B + Gc + R) + 1.0
+    crf_B = np.log(alpha * B / sum_channels + 1.0)
+    crf_G = np.log(alpha * Gc / sum_channels + 1.0)
+    crf_R = np.log(alpha * R / sum_channels + 1.0)
+
+    # apply MSRCR
+    out_B = G * msr_B * crf_B
+    out_G = G * msr_G * crf_G
+    out_R = G * msr_R * crf_R
+
+    out = cv2.merge([out_B, out_G, out_R])
+
+    # linear scaling to 0-255 with gain and offset
+    out = (out - np.min(out)) / (np.max(out) - np.min(out) + 1e-8) * 255.0
+    out = out + b
+    out = np.clip(out, 0, 255).astype(np.uint8)
+    return out
 
 
 
@@ -241,53 +302,92 @@ def sharpen_image(img):
     return sharp
 
 
-def restore_image(img, sat_scale=1.25):
-    """Restore image using median denoising, white-balance, CLAHE,
-    saturation boost and mild sharpening.
+def restore_image(img, sat_scale=1.25, nlm_h=10, median_k=5, clahe_clip=2.0,
+                  sat_scale_override=None, unsharp_amount=0.5, spot_thresh=30,
+                  spot_blur=9, spot_min_frac=5e-5, inpaint_radius=3):
+    """Restore image with tunable parameters for classical DIP restoration.
 
-    This implements the improved pipeline provided by the user:
-    Median filter -> White balance (LAB) -> CLAHE on L channel ->
-    Saturation increase in HSV -> Mild sharpening
+    Parameters are tunable to create presets for mild/balanced/aggressive.
     """
     # Step 1: Choose denoising method adaptively based on estimated noise
     noise_lvl = estimate_noise(img)
     if noise_lvl > 10.0:
-        # strong noise -> use Non-Local Means (better for heavy grain)
-        denoise = nl_means_denoise(img, h=10, hColor=10)
+        denoise = nl_means_denoise(img, h=nlm_h, hColor=nlm_h)
     else:
-        denoise = cv2.medianBlur(img, 5)
+        denoise = cv2.medianBlur(img, median_k)
 
-    # Step 2: White balance. Use Gray-World for faded color casts,
-    # which is usually more robust for yellowing than the LAB tweak.
+    # Step 2: White balance using Gray-World
     result = white_balance_grayworld(denoise)
 
     # Spot detection & inpainting (remove dust/specks) if present
-    mask, have_spots = detect_spots_mask(result, thresh=30, blur_size=9, min_frac=5e-5)
+    mask, have_spots = detect_spots_mask(result, thresh=spot_thresh, blur_size=spot_blur, min_frac=spot_min_frac)
     if have_spots:
-        result = inpaint_spots(result, mask)
+        # perform inpainting with provided radius to remove detected specks
+        result = cv2.inpaint(result, mask, inpaint_radius, cv2.INPAINT_TELEA)
 
-    # Step 3: Contrast enhancement using CLAHE on L channel
+    # Step 3: Contrast enhancement using CLAHE on L channel (or MSRCR)
+    # By default use CLAHE; MSRCR will be applied if msr=True passed via kwargs.
     lab2 = cv2.cvtColor(result, cv2.COLOR_BGR2LAB)
     l2, a2, b2 = cv2.split(lab2)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    clahe = cv2.createCLAHE(clipLimit=clahe_clip, tileGridSize=(8, 8))
     cl = clahe.apply(l2)
     merged = cv2.merge((cl, a2, b2))
     contrast = cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
 
-    # Step 4: Increase saturation in HSV (moderate)
+    # Step 4: Increase saturation in HSV
     hsv = cv2.cvtColor(contrast, cv2.COLOR_BGR2HSV).astype(np.float32)
     h, s, v = cv2.split(hsv)
-    s = np.clip(s * 1.15, 0, 255).astype(np.uint8)
+    scale = sat_scale_override if sat_scale_override is not None else sat_scale
+    s = np.clip(s * scale, 0, 255).astype(np.uint8)
     hsv = cv2.merge((h.astype(np.uint8), s, v.astype(np.uint8)))
     color = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
 
-    # Step 5: Mild sharpening via unsharp masking (preserves brightness)
-    # unsharp: result = original * (1 + amount) - blurred * amount
-    amount = 0.5
+    # Step 5: Mild sharpening via unsharp masking
     blurred = cv2.GaussianBlur(color, (0, 0), sigmaX=1.0)
-    sharpen = cv2.addWeighted(color, 1.0 + amount, blurred, -amount, 0)
+    sharpen = cv2.addWeighted(color, 1.0 + unsharp_amount, blurred, -unsharp_amount, 0)
 
     return sharpen
+
+
+def restore_image_msr_wrapper(img, **kwargs):
+    """Wrapper: if msr True in kwargs, apply MSRCR instead of CLAHE step.
+
+    This function calls restore_image but replaces the contrast step output
+    with MSRCR if requested.
+    """
+    msr_flag = kwargs.pop('msr', False)
+    # run the standard pipeline first
+    restored = restore_image(img, **kwargs)
+    if not msr_flag:
+        return restored
+
+    # If msr_flag True: recompute a base image from denoising + inpainting
+    noise_lvl = estimate_noise(img)
+    nlm_h = kwargs.get('nlm_h', 10)
+    median_k = kwargs.get('median_k', 5)
+    if noise_lvl > 10.0:
+        base = nl_means_denoise(img, h=nlm_h, hColor=nlm_h)
+    else:
+        base = cv2.medianBlur(img, median_k)
+    base = white_balance_grayworld(base)
+    mask, have_spots = detect_spots_mask(base, thresh=kwargs.get('spot_thresh', 30), blur_size=kwargs.get('spot_blur', 9), min_frac=kwargs.get('spot_min_frac', 5e-5))
+    if have_spots:
+        base = cv2.inpaint(base, mask, kwargs.get('inpaint_radius', 3), cv2.INPAINT_TELEA)
+
+    # Apply MSRCR
+    msr_img = msrcr(base)
+
+    # After MSRCR, increase saturation and sharpen as in main pipeline
+    hsv = cv2.cvtColor(msr_img, cv2.COLOR_BGR2HSV).astype(np.float32)
+    h, s, v = cv2.split(hsv)
+    scale = kwargs.get('sat_scale_override', None) or kwargs.get('sat_scale', 1.25)
+    s = np.clip(s * scale, 0, 255).astype(np.uint8)
+    hsv = cv2.merge((h.astype(np.uint8), s, v.astype(np.uint8)))
+    color = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+    blurred = cv2.GaussianBlur(color, (0, 0), sigmaX=1.0)
+    unsharp_amount = kwargs.get('unsharp_amount', 0.5)
+    final = cv2.addWeighted(color, 1.0 + unsharp_amount, blurred, -unsharp_amount, 0)
+    return final
 
 
 def analyze_and_restore(img, sat_scale=1.25, noise_thresh=10.0, contrast_thresh=30.0):
