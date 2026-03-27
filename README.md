@@ -25,7 +25,7 @@ Advanced Digital Image Processing (DIP) pipeline to restore faded, noisy, or dus
 
 🎯 **Input:** Scanned/photographed old images (jpg, png, bmp, tiff)  
 📁 **Input Folder:** `dataset/old_images/`  
-🎨 **Processing:** Classical DIP pipeline (denoising, gentle white balance, spot removal, contrast, saturation, sharpening)  
+🎨 **Processing:** Classical DIP pipeline (denoising, gentle white balance, spot removal, contrast, saturation, unsharp masking)  
 💾 **Output Folder:** `results/restored_images/`  
 🖼️ **Comparison Saved:** `results/restored_images/comparison_{name}` — side-by-side original vs restored  
 📊 **Metrics:** MSE, PSNR, SSIM quality assessment
@@ -36,7 +36,7 @@ Advanced Digital Image Processing (DIP) pipeline to restore faded, noisy, or dus
 - Spot detection + Telea inpainting (dust removal)
 - CLAHE (local contrast enhancement, tuned to avoid over-darkening)
 - Saturation boost (revive faded colors)
-- Unsharp masking (detail enhancement)
+- Unsharp masking (detail/edge enhancement — only sharpening method used)
 - Multi‑Scale Retinex — available but optional
 
 ---
@@ -147,11 +147,11 @@ color_restoration_project/
         └────────┬─────────────────┘
                  │
                  ▼
-        ┌──────────────────────────┐
-        │  SHARPENING              │
-        │  Unsharp Mask            │
-        │  unsharp_amount = 0.3    │
-        └────────┬─────────────────┘
+        ┌──────────────────────────────┐
+        │  UNSHARP MASKING             │
+        │  Detail/Edge Enhancement     │
+        │  unsharp_amount = 0.3        │
+        └────────┬─────────────────────┘
                  │
                  ▼
         ┌──────────────────────────┐
@@ -184,7 +184,7 @@ flowchart TD
     F --> G["🌟 Detect & Inpaint\nDust/Scratches"]
     G --> H["🌗 Contrast Enhancement\nCLAHE clipLimit=1.1"]
     H --> I["🌈 Saturation Boost\nsat_scale=1.5 in HSV"]
-    I --> J["✨ Sharpening\nUnsharp Mask amount=0.3"]
+    I --> J["✨ Unsharp Masking\nEdge Enhancement amount=0.3"]
     J --> K["📊 Metrics\nMSE/PSNR/SSIM"]
     K --> L["💾 Save Result\nrestored_* + comparison_*"]
     L --> M["✅ Output Image"]
@@ -347,26 +347,32 @@ Revives faded chroma (saturation).
 
 ---
 
-### 7️⃣ Sharpening
+### 7️⃣ Unsharp Masking
 
-Enhances edge definition and detail using **Unsharp Masking**.
+Enhances edge definition and fine detail by finding and boosting edges only.
 
-#### Unsharp Masking (Active in pipeline)
-- **Method:** Blur the image slightly, then add the difference back
-- **Formula:** `sharp = original + amount × (original – blurred)`
-- **OpenCV:** `cv2.addWeighted()`
+#### How It Works
+- **Method:** Blur the image slightly → subtract blurred from original → add the difference back
+- **Formula:** `output = original + amount × (original – blurred)`
+- **OpenCV:** `cv2.GaussianBlur()` + `cv2.addWeighted()`
 - **Current tuned value:** `unsharp_amount = 0.3`
 - **Caution:** High amounts → halos/ringing at edges
 
-#### Kernel Sharpening (Available, not used in pipeline)
-- **Function:** `sharpen_image()`
-- **Kernel:**
-  ```
-  [  0  -1   0 ]
-  [ -1   5  -1 ]
-  [  0  -1   0 ]
-  ```
-- **Note:** This Laplacian-style kernel exists in `restoration.py` but is **not called** anywhere in the pipeline. Unsharp masking is used instead as it is gentler and more controllable for old photos.
+#### Code in `restoration.py`
+```python
+blurred = cv2.GaussianBlur(color, (0, 0), sigmaX=1.0)
+sharpen = cv2.addWeighted(color, 1.0 + unsharp_amount, blurred, -unsharp_amount, 0)
+# With unsharp_amount=0.3:
+# output = (1.3 × original) - (0.3 × blurred)
+# = original + 0.3 × (original - blurred)
+# = original + 0.3 × edges_only
+```
+
+#### Why Unsharp Masking and not Laplacian Kernel?
+Unsharp masking is the **only sharpening method used** in this pipeline. It was chosen because:
+- Strength is fully controllable via `unsharp_amount`
+- Gentle and natural — does not amplify noise
+- Safe for old photos with existing grain/texture
 
 ---
 
@@ -612,6 +618,7 @@ clahe_clip=1.0
 **Fix:**
 ```python
 restore_image(img, nlm_h=6, clahe_clip=1.1, unsharp_amount=0.3)
+# unsharp_amount=0.3 adds back edge detail gently
 ```
 
 ### Issue: Restoration barely visible
@@ -707,7 +714,7 @@ result = cv2.addWeighted(denoise, blend_ratio, wb, 1-blend_ratio, 0)
 
 ## Release Checklist
 
-- [x] Core pipeline (denoising, white balance, CLAHE, saturation, sharpening)
+- [x] Core pipeline (denoising, white balance, CLAHE, saturation, unsharp masking)
 - [x] Gentle white balance blend (60% original + 40% gray-world) to preserve warm tones
 - [x] Tuned parameters for sepia/faded old photographs
 - [x] Per-image error handling & logging
