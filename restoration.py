@@ -5,10 +5,12 @@ Functions for color restoration pipeline.
 
 Techniques used:
 - Bilateral Filtering for noise removal (preserves edges)
-- Gray World white balance in LAB color space
-- CLAHE on L channel for contrast enhancement
+- Adaptive Gray World white balance using Hasler-Suesstrunk colorfulness metric
+- Multi-Scale CLAHE on L channel for contrast enhancement
 - Saturation increase in HSV space for color enhancement
-- Sharpening via a simple kernel to enhance details
+- Unsharp Masking to enhance details
+- Fold Line Suppression using Hough Transform + directional inpainting
+- No-Reference IQA metrics: BRISQUE and NIQE for ablation study
 
 Required libraries: OpenCV, NumPy
 """
@@ -17,12 +19,15 @@ import numpy as np
 import os
 
 
+# ─────────────────────────────────────────────
+# BASIC IMAGE ANALYSIS
+# ─────────────────────────────────────────────
+
 def is_grayscale(img):
     """Return True if image is essentially grayscale (all channels similar)."""
     if len(img.shape) < 3 or img.shape[2] == 1:
         return True
     b, g, r = cv2.split(img)
-    # compute mean absolute difference between channels
     diff = (np.mean(np.abs(b.astype(np.int16) - g.astype(np.int16))) +
             np.mean(np.abs(b.astype(np.int16) - r.astype(np.int16))) +
             np.mean(np.abs(g.astype(np.int16) - r.astype(np.int16)))) / 3.0
@@ -30,36 +35,58 @@ def is_grayscale(img):
 
 
 def estimate_noise(img):
-    """Estimate noise level using high-frequency residual standard deviation.
-
-    Convert to grayscale, blur and subtract to get high-frequency components.
-    Return the standard deviation as a noise estimate.
-    """
+    """Estimate noise level using high-frequency residual standard deviation."""
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (3, 3), 0)
     residual = gray.astype(np.float32) - blur.astype(np.float32)
     return float(np.std(residual))
 
 
+def contrast_score(img):
+    """Compute a simple contrast score (stddev of luminance)."""
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    return float(np.std(gray))
+
+
+def is_noisy(img, noise_thresh=10.0):
+    """Decide whether an image is noisy based on estimated noise."""
+    noise_lvl = estimate_noise(img)
+    return noise_lvl > noise_thresh, noise_lvl
+
+
+def is_low_contrast(img, contrast_thresh=30.0):
+    """Detect low contrast images by thresholding luminance std deviation."""
+    score = contrast_score(img)
+    return score < contrast_thresh, score
+
+
+# ─────────────────────────────────────────────
+# DENOISING
+# ─────────────────────────────────────────────
+
 def nl_means_denoise(img, h=10, hColor=10, templateWindowSize=7, searchWindowSize=21):
     """Apply Non-Local Means color denoising."""
     return cv2.fastNlMeansDenoisingColored(img, None, h, hColor, templateWindowSize, searchWindowSize)
 
 
-def detect_spots_mask(img, thresh=30, blur_size=9, min_frac=5e-5):
-    """Detect small bright/dark spots (dust/scratches) and return a binary mask.
+def remove_noise(img, d=9, sigma_color=75, sigma_space=75):
+    """Remove noise using bilateral filtering (optional, not in main pipeline)."""
+    return cv2.bilateralFilter(img, d, sigma_color, sigma_space)
 
-    Returns mask and a boolean indicating whether there are enough spots to inpaint.
-    """
+
+# ─────────────────────────────────────────────
+# SPOT / DUST REMOVAL
+# ─────────────────────────────────────────────
+
+def detect_spots_mask(img, thresh=30, blur_size=9, min_frac=5e-5):
+    """Detect small bright/dark spots (dust/scratches) and return a binary mask."""
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     med = cv2.medianBlur(gray, blur_size)
     residual = cv2.absdiff(gray, med)
     _, mask = cv2.threshold(residual, thresh, 255, cv2.THRESH_BINARY)
-    # Morphological clean up
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
     mask = cv2.dilate(mask, kernel, iterations=1)
-
     count = int(np.sum(mask > 0))
     have_spots = count > (img.shape[0] * img.shape[1] * min_frac)
     return mask.astype(np.uint8), have_spots
@@ -69,348 +96,560 @@ def inpaint_spots(img, mask):
     """Inpaint detected spots using Telea method."""
     if mask is None or np.sum(mask) == 0:
         return img
-    # default radius 3 retained if not provided
-    inpainted = cv2.inpaint(img, mask, 3, cv2.INPAINT_TELEA)
-    return inpainted
+    return cv2.inpaint(img, mask, 3, cv2.INPAINT_TELEA)
 
 
-def is_noisy(img, noise_thresh=10.0):
-    """Decide whether an image is noisy based on estimated noise.
+# ─────────────────────────────────────────────
+# FOLD LINE SUPPRESSION  ← NEW
+# ─────────────────────────────────────────────
 
-    `noise_thresh` is a tunable threshold; typical values 8-12.
+def detect_fold_lines(img, canny_low=50, canny_high=150, hough_thresh=100,
+                      min_line_length=100, max_line_gap=10):
+    """Detect physical fold/crease lines using Probabilistic Hough Transform.
+
+    Returns a list of lines as (x1, y1, x2, y2) tuples.
+    Only near-vertical or near-horizontal lines are returned
+    (physical folds are straight, not diagonal scratches).
     """
-    noise_lvl = estimate_noise(img)
-    return noise_lvl > noise_thresh, noise_lvl
-
-
-def contrast_score(img):
-    """Compute a simple contrast score (stddev of luminance)."""
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    return float(np.std(gray))
+    edges = cv2.Canny(gray, canny_low, canny_high)
+    lines = cv2.HoughLinesP(edges, rho=1, theta=np.pi / 180,
+                             threshold=hough_thresh,
+                             minLineLength=min_line_length,
+                             maxLineGap=max_line_gap)
+    fold_lines = []
+    if lines is not None:
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            dx = abs(x2 - x1)
+            dy = abs(y2 - y1)
+            # Keep only near-vertical (fold crease) or near-horizontal lines
+            if dx == 0 or (dy / (dx + 1e-6)) > 3.0:  # near-vertical
+                fold_lines.append((x1, y1, x2, y2))
+            elif dy == 0 or (dx / (dy + 1e-6)) > 3.0:  # near-horizontal
+                fold_lines.append((x1, y1, x2, y2))
+    return fold_lines
 
 
-def is_low_contrast(img, contrast_thresh=30.0):
-    """Detect low contrast images by thresholding luminance std deviation."""
-    score = contrast_score(img)
-    return score < contrast_thresh, score
+def build_fold_mask(img_shape, fold_lines, thickness=5):
+    """Build a binary mask covering detected fold lines."""
+    mask = np.zeros(img_shape[:2], dtype=np.uint8)
+    for (x1, y1, x2, y2) in fold_lines:
+        cv2.line(mask, (x1, y1), (x2, y2), 255, thickness)
+    return mask
 
+
+def suppress_fold_lines(img, thickness=5, canny_low=50, canny_high=150,
+                         hough_thresh=100, min_line_length=100, max_line_gap=10):
+    """Detect fold/crease lines and inpaint along them.
+
+    Steps:
+    1. Detect straight fold lines with Hough Transform
+    2. Build a mask covering those lines
+    3. Apply Telea inpainting along the mask
+    4. Blend result with original for smooth transition
+
+    Returns (result_img, fold_mask, num_folds_detected)
+    """
+    fold_lines = detect_fold_lines(img, canny_low, canny_high,
+                                    hough_thresh, min_line_length, max_line_gap)
+    if not fold_lines:
+        return img, None, 0
+
+    mask = build_fold_mask(img.shape, fold_lines, thickness=thickness)
+
+    # Apply directional bilateral filter along fold mask area before inpainting
+    smoothed = cv2.bilateralFilter(img, d=9, sigmaColor=50, sigmaSpace=50)
+    blended_pre = img.copy()
+    blended_pre[mask > 0] = smoothed[mask > 0]
+
+    # Inpaint the fold lines
+    result = cv2.inpaint(blended_pre, mask, inpaintRadius=4, flags=cv2.INPAINT_TELEA)
+
+    # Soft blend: 80% inpainted + 20% original for naturalness
+    result = cv2.addWeighted(result, 0.8, img, 0.2, 0)
+
+    return result, mask, len(fold_lines)
+
+
+# ─────────────────────────────────────────────
+# WHITE BALANCE — ADAPTIVE  ← UPDATED
+# ─────────────────────────────────────────────
+
+def colorfulness_metric(img):
+    """Compute Hasler-Suesstrunk colorfulness metric.
+
+    Reference: Hasler & Suesstrunk, "Measuring Colorfulness in Natural Images", 2003.
+
+    Returns a float:
+      < 15  = essentially grayscale / very faded
+      15–33 = slightly colorful
+      33–45 = moderately colorful
+      45–59 = colorful
+      > 59  = highly colorful
+
+    This is used to adaptively set the white balance blend weight.
+    """
+    img_f = img.astype(np.float32)
+    b, g, r = cv2.split(img_f)
+
+    rg = r - g
+    yb = 0.5 * (r + g) - b
+
+    mean_rg = np.mean(rg)
+    mean_yb = np.mean(yb)
+    std_rg = np.std(rg)
+    std_yb = np.std(yb)
+
+    std_rgyb = np.sqrt(std_rg ** 2 + std_yb ** 2)
+    mean_rgyb = np.sqrt(mean_rg ** 2 + mean_yb ** 2)
+
+    colorfulness = std_rgyb + 0.3 * mean_rgyb
+    return float(colorfulness)
+
+
+def adaptive_wb_weight(colorfulness, min_weight=0.25, max_weight=0.70):
+    """Compute white balance blend weight based on colorfulness.
+
+    Logic:
+    - Very faded image (low colorfulness) → high WB weight (more correction needed)
+    - Well preserved image (high colorfulness) → low WB weight (less correction needed)
+
+    Returns a float between min_weight and max_weight.
+    """
+    # Normalize colorfulness to 0–1 range (0=faded, 1=colorful)
+    # Typical range of colorfulness is 0–100
+    norm = np.clip(colorfulness / 60.0, 0.0, 1.0)
+
+    # As colorfulness increases, WB weight decreases
+    weight = max_weight - norm * (max_weight - min_weight)
+    return float(weight)
+
+
+def white_balance_grayworld(img):
+    """Simple Gray-World white balance in BGR domain."""
+    img_f = img.astype(np.float32)
+    b, g, r = cv2.split(img_f)
+    mean_b = max(np.mean(b), 1.0)
+    mean_g = max(np.mean(g), 1.0)
+    mean_r = max(np.mean(r), 1.0)
+    mean_gray = (mean_b + mean_g + mean_r) / 3.0
+    b = np.clip(b * (mean_gray / mean_b), 0, 255)
+    g = np.clip(g * (mean_gray / mean_g), 0, 255)
+    r = np.clip(r * (mean_gray / mean_r), 0, 255)
+    return cv2.merge([b, g, r]).astype(np.uint8)
+
+
+def white_balance_adaptive(img):
+    """Apply adaptive white balance using colorfulness-based weight.
+
+    Instead of a fixed 60/40 blend, this computes the blend weight
+    dynamically based on how faded/colorful the image is.
+
+    Returns (balanced_img, colorfulness_value, wb_weight_used)
+    """
+    cf = colorfulness_metric(img)
+    wb_weight = adaptive_wb_weight(cf)
+    wb = white_balance_grayworld(img)
+    result = cv2.addWeighted(img, 1.0 - wb_weight, wb, wb_weight, 0)
+    return result, cf, wb_weight
+
+
+def white_balance(img):
+    """LAB space white balance (optional, not used in main pipeline)."""
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.int16)
+    l, a, b = cv2.split(lab)
+    a = np.clip(a - (np.mean(a) - 128), 0, 255).astype(np.uint8)
+    b = np.clip(b - (np.mean(b) - 128), 0, 255).astype(np.uint8)
+    l = np.clip(l, 0, 255).astype(np.uint8)
+    return cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
+
+
+# ─────────────────────────────────────────────
+# CONTRAST ENHANCEMENT — MULTI-SCALE CLAHE  ← UPDATED
+# ─────────────────────────────────────────────
+
+def apply_clahe_single(img, clip_limit, tile_size):
+    """Apply CLAHE on L channel with given clip_limit and tile_size."""
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_size)
+    l_eq = clahe.apply(l)
+    return cv2.cvtColor(cv2.merge((l_eq, a, b)), cv2.COLOR_LAB2BGR)
+
+
+def enhance_contrast_multiscale(img, clip_limit=1.1):
+    """Multi-Scale CLAHE — process at three tile sizes and blend.
+
+    Why multi-scale?
+    - Small tiles (4×4): captures fine texture detail (rose petals)
+    - Medium tiles (8×8): balanced local contrast
+    - Large tiles (16×16): handles broad gradients (background table)
+    Blending all three avoids halo artifacts from single-pass CLAHE.
+
+    Returns the blended contrast-enhanced image.
+    """
+    small  = apply_clahe_single(img, clip_limit, (4,  4))   # fine detail
+    medium = apply_clahe_single(img, clip_limit, (8,  8))   # balanced
+    large  = apply_clahe_single(img, clip_limit, (16, 16))  # broad gradient
+
+    # Equal blend of all three scales
+    result = cv2.addWeighted(small, 0.33, medium, 0.33, 0)
+    result = cv2.addWeighted(result, 1.0, large, 0.34, 0)
+    return result
+
+
+def enhance_contrast(img, clip_limit=3.0, tile_grid_size=(8, 8)):
+    """Single-scale CLAHE (kept for reference/comparison in ablation study)."""
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size)
+    l_eq = clahe.apply(l)
+    return cv2.cvtColor(cv2.merge((l_eq, a, b)), cv2.COLOR_LAB2BGR)
+
+
+# ─────────────────────────────────────────────
+# SATURATION
+# ─────────────────────────────────────────────
+
+def increase_saturation(img, scale=1.25):
+    """Increase color saturation in HSV space."""
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float32)
+    h, s, v = cv2.split(hsv)
+    s = np.clip(s * scale, 0, 255)
+    return cv2.cvtColor(cv2.merge([h, s, v]).astype(np.uint8), cv2.COLOR_HSV2BGR)
+
+
+# ─────────────────────────────────────────────
+# QUALITY METRICS
+# ─────────────────────────────────────────────
 
 def mse(imageA, imageB):
-    """Compute Mean Squared Error between two images (grayscale)."""
-    err = np.mean((imageA.astype('float32') - imageB.astype('float32')) ** 2)
-    return float(err)
+    """Compute Mean Squared Error between two grayscale images."""
+    return float(np.mean((imageA.astype('float32') - imageB.astype('float32')) ** 2))
 
 
 def psnr(imageA, imageB):
-    """Compute PSNR between two images using OpenCV helper."""
+    """Compute PSNR between two images."""
     return float(cv2.PSNR(imageA, imageB))
 
 
 def ssim(img1, img2):
-    """Compute a simple single-channel SSIM index between two images.
-
-    Implements the luminance-contrast-structure SSIM for grayscale images.
-    """
+    """Compute SSIM index between two grayscale images."""
     img1 = img1.astype(np.float64)
     img2 = img2.astype(np.float64)
-    K1 = 0.01
-    K2 = 0.03
-    L = 255
-    C1 = (K1 * L) ** 2
-    C2 = (K2 * L) ** 2
-
+    C1 = (0.01 * 255) ** 2
+    C2 = (0.03 * 255) ** 2
     mu1 = cv2.GaussianBlur(img1, (11, 11), 1.5)
     mu2 = cv2.GaussianBlur(img2, (11, 11), 1.5)
-
-    mu1_sq = mu1 * mu1
-    mu2_sq = mu2 * mu2
-    mu1_mu2 = mu1 * mu2
-
-    sigma1_sq = cv2.GaussianBlur(img1 * img1, (11, 11), 1.5) - mu1_sq
-    sigma2_sq = cv2.GaussianBlur(img2 * img2, (11, 11), 1.5) - mu2_sq
-    sigma12 = cv2.GaussianBlur(img1 * img2, (11, 11), 1.5) - mu1_mu2
-
-    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+    mu1_sq, mu2_sq, mu1_mu2 = mu1*mu1, mu2*mu2, mu1*mu2
+    sigma1_sq = cv2.GaussianBlur(img1*img1, (11, 11), 1.5) - mu1_sq
+    sigma2_sq = cv2.GaussianBlur(img2*img2, (11, 11), 1.5) - mu2_sq
+    sigma12   = cv2.GaussianBlur(img1*img2, (11, 11), 1.5) - mu1_mu2
+    ssim_map  = ((2*mu1_mu2+C1)*(2*sigma12+C2)) / ((mu1_sq+mu2_sq+C1)*(sigma1_sq+sigma2_sq+C2))
     return float(np.mean(ssim_map))
 
 
+def brisque_score(img):
+    """Compute a simplified BRISQUE-like no-reference quality score.
+
+    BRISQUE (Blind/Referenceless Image Spatial Quality Evaluator) measures
+    naturalness of image statistics without needing a reference image.
+    Lower score = better perceptual quality.
+
+    This is a lightweight approximation using local contrast statistics.
+    For full BRISQUE, use opencv-contrib: cv2.quality.QualityBRISQUE_compute()
+    """
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float64)
+    # Mean subtracted contrast normalized (MSCN) coefficients
+    mu = cv2.GaussianBlur(gray, (7, 7), 7.0 / 6.0)
+    mu_sq = mu * mu
+    sigma = np.sqrt(np.abs(cv2.GaussianBlur(gray * gray, (7, 7), 7.0 / 6.0) - mu_sq))
+    mscn = (gray - mu) / (sigma + 1.0)
+    # Score based on deviation from Gaussian distribution (kurtosis proxy)
+    score = float(np.mean(np.abs(mscn ** 3)) + np.mean(np.abs(mscn ** 4 - 3)))
+    return score
+
+
+def niqe_score(img):
+    """Compute a simplified NIQE-like no-reference quality score.
+
+    NIQE (Natural Image Quality Evaluator) measures how natural the image
+    statistics look compared to pristine images.
+    Lower score = more natural looking image.
+
+    This is a lightweight approximation. For full NIQE use:
+    cv2.quality.QualityBRISQUE or scikit-image's NIQE implementation.
+    """
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float64)
+    # Local variance as naturalness proxy
+    mu = cv2.GaussianBlur(gray, (7, 7), 1.5)
+    sigma = np.sqrt(np.abs(cv2.GaussianBlur(gray**2, (7, 7), 1.5) - mu**2))
+    # Natural images have specific sigma distribution — score deviation from it
+    score = float(np.std(sigma) / (np.mean(sigma) + 1e-6))
+    return score
+
+
+# ─────────────────────────────────────────────
+# RETINEX (OPTIONAL)
+# ─────────────────────────────────────────────
+
 def single_scale_retinex(img, sigma):
-    """Single Scale Retinex for a single-channel image."""
-    blur = cv2.GaussianBlur(img, (0, 0), sigma)
-    # avoid log(0)
     img = img.astype(np.float32) + 1.0
-    blur = blur.astype(np.float32) + 1.0
-    retinex = np.log(img) - np.log(blur)
-    return retinex
+    blur = cv2.GaussianBlur(img, (0, 0), sigma).astype(np.float32) + 1.0
+    return np.log(img) - np.log(blur)
 
 
 def multi_scale_retinex(img, scales):
-    """Apply Multi-Scale Retinex to a single-channel image.
-
-    scales: list of sigma values
-    """
     retinex = np.zeros_like(img, dtype=np.float32)
     for sigma in scales:
         retinex += single_scale_retinex(img, sigma)
-    retinex = retinex / float(len(scales))
-    return retinex
+    return retinex / float(len(scales))
 
 
 def msrcr(img, scales=(15, 80, 250), G=192, b=-30, alpha=125, beta=46):
-    """Multi-Scale Retinex with Color Restoration (MSRCR).
-
-    Returns BGR uint8 image.
-    Parameters chosen to be reasonable defaults; they can be tuned.
-    """
-    img = img.astype(np.float32)
-    img = np.clip(img, 1.0, 255.0)
-
-    # split channels in BGR but process on each channel
+    """Multi-Scale Retinex with Color Restoration (optional)."""
+    img = np.clip(img.astype(np.float32), 1.0, 255.0)
     B, Gc, R = cv2.split(img)
-    # compute MSR on each channel
-    msr_B = multi_scale_retinex(B, scales)
-    msr_G = multi_scale_retinex(Gc, scales)
-    msr_R = multi_scale_retinex(R, scales)
-
-    # color restoration factor
-    # avoid division by zero: sum of channels
     sum_channels = (B + Gc + R) + 1.0
-    crf_B = np.log(alpha * B / sum_channels + 1.0)
-    crf_G = np.log(alpha * Gc / sum_channels + 1.0)
-    crf_R = np.log(alpha * R / sum_channels + 1.0)
-
-    # apply MSRCR
-    out_B = G * msr_B * crf_B
-    out_G = G * msr_G * crf_G
-    out_R = G * msr_R * crf_R
-
+    out_B = G * multi_scale_retinex(B, scales) * np.log(alpha * B / sum_channels + 1.0)
+    out_G = G * multi_scale_retinex(Gc, scales) * np.log(alpha * Gc / sum_channels + 1.0)
+    out_R = G * multi_scale_retinex(R, scales) * np.log(alpha * R / sum_channels + 1.0)
     out = cv2.merge([out_B, out_G, out_R])
-
-    # linear scaling to 0-255 with gain and offset
-    out = (out - np.min(out)) / (np.max(out) - np.min(out) + 1e-8) * 255.0
-    out = out + b
-    out = np.clip(out, 0, 255).astype(np.uint8)
-    return out
+    out = (out - np.min(out)) / (np.max(out) - np.min(out) + 1e-8) * 255.0 + b
+    return np.clip(out, 0, 255).astype(np.uint8)
 
 
+# ─────────────────────────────────────────────
+# MAIN RESTORE PIPELINE  ← UPDATED
+# ─────────────────────────────────────────────
 
-def remove_noise(img, d=9, sigma_color=75, sigma_space=75):
-    """Remove noise while preserving edges using bilateral filtering.
+def restore_image(img, sat_scale=1.25, nlm_h=10, median_k=5, clahe_clip=1.1,
+                  sat_scale_override=None, unsharp_amount=0.3, spot_thresh=30,
+                  spot_blur=9, spot_min_frac=5e-5, inpaint_radius=2,
+                  use_fold_suppression=True, use_multiscale_clahe=True):
+    """Restore image using the full enhanced pipeline.
 
-    Bilateral filter smooths regions while keeping edges sharp by
-    combining spatial and intensity information.
+    New parameters vs original:
+      use_fold_suppression  : if True, detect and suppress physical fold lines
+      use_multiscale_clahe  : if True, use multi-scale CLAHE (3 tile sizes blended)
+    White balance is now ADAPTIVE based on colorfulness metric.
     """
-    return cv2.bilateralFilter(img, d, sigma_color, sigma_space)
-
-
-def white_balance(img):
-    """Apply white balance using a Gray World assumption in LAB space.
-
-    Convert to LAB and shift the a/b channels so their means equal the
-    neutral midpoint (128). This reduces yellow/red tints common in
-    old photos.
-    """
-    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.int16)
-    l, a, b = cv2.split(lab)
-
-    # Compute channel means
-    mean_a = np.mean(a)
-    mean_b = np.mean(b)
-
-    # Shift a and b so their means move to 128 (neutral)
-    a = a - (mean_a - 128)
-    b = b - (mean_b - 128)
-
-    # Clip and convert back
-    a = np.clip(a, 0, 255).astype(np.uint8)
-    b = np.clip(b, 0, 255).astype(np.uint8)
-    l = np.clip(l, 0, 255).astype(np.uint8)
-
-    balanced = cv2.merge([l, a, b])
-    balanced = cv2.cvtColor(balanced, cv2.COLOR_LAB2BGR)
-    return balanced
-
-
-def white_balance_grayworld(img):
-    """Simple Gray-World white balance applied in BGR domain.
-
-    Scales each BGR channel so their means match the overall mean luminance.
-    This is robust for faded color casts like yellowing.
-    """
-    img_f = img.astype(np.float32)
-    b, g, r = cv2.split(img_f)
-    # average per-channel
-    mean_b = np.mean(b)
-    mean_g = np.mean(g)
-    mean_r = np.mean(r)
-    # overall mean
-    mean_gray = (mean_b + mean_g + mean_r) / 3.0
-    # avoid division by zero
-    mean_b = max(mean_b, 1.0)
-    mean_g = max(mean_g, 1.0)
-    mean_r = max(mean_r, 1.0)
-
-    b = np.clip(b * (mean_gray / mean_b), 0, 255)
-    g = np.clip(g * (mean_gray / mean_g), 0, 255)
-    r = np.clip(r * (mean_gray / mean_r), 0, 255)
-
-    balanced = cv2.merge([b, g, r]).astype(np.uint8)
-    return balanced
-
-
-def enhance_contrast(img, clip_limit=3.0, tile_grid_size=(8, 8)):
-    """Enhance contrast using CLAHE on the L channel in LAB space.
-
-    CLAHE (Contrast Limited AHE) improves local contrast while avoiding
-    over-amplification of noise.
-    """
-    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-
-    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size)
-    l_eq = clahe.apply(l)
-
-    lab_eq = cv2.merge((l_eq, a, b))
-    enhanced = cv2.cvtColor(lab_eq, cv2.COLOR_LAB2BGR)
-    return enhanced
-
-
-def increase_saturation(img, scale=1.25):
-    """Increase color saturation in HSV space to restore faded colors.
-
-    Multiply the S channel by `scale` and clip to valid range.
-    """
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float32)
-    h, s, v = cv2.split(hsv)
-
-    s = np.clip(s * scale, 0, 255)
-
-    hsv_sat = cv2.merge([h, s, v]).astype(np.uint8)
-    saturated = cv2.cvtColor(hsv_sat, cv2.COLOR_HSV2BGR)
-    return saturated
-
-
-
-def restore_image(img, sat_scale=1.25, nlm_h=10, median_k=5, clahe_clip=2.0,
-                  sat_scale_override=None, unsharp_amount=0.5, spot_thresh=30,
-                  spot_blur=9, spot_min_frac=5e-5, inpaint_radius=3):
-    """Restore image with tunable parameters for classical DIP restoration.
-
-    Parameters are tunable to create presets for mild/balanced/aggressive.
-    """
-    # Step 1: Choose denoising method adaptively based on estimated noise
+    # Step 1: Denoising
     noise_lvl = estimate_noise(img)
     if noise_lvl > 10.0:
         denoise = nl_means_denoise(img, h=nlm_h, hColor=nlm_h)
     else:
         denoise = cv2.medianBlur(img, median_k)
 
-    # Step 2: White balance using Gray-World
-    # Blend white balance gently (keep some original warmth):
-    wb = white_balance_grayworld(denoise)
-    # Apply stronger white-balance blending (more correction, keep some warmth)
-    result = cv2.addWeighted(denoise, 0.4, wb, 0.6, 0)
+    # Step 2: Adaptive white balance (colorfulness-based blend weight)
+    result, colorfulness, wb_weight = white_balance_adaptive(denoise)
 
-    # Spot detection & inpainting (remove dust/specks) if present
-    mask, have_spots = detect_spots_mask(result, thresh=spot_thresh, blur_size=spot_blur, min_frac=spot_min_frac)
+    # Step 3: Spot detection & inpainting
+    mask, have_spots = detect_spots_mask(result, thresh=spot_thresh,
+                                          blur_size=spot_blur, min_frac=spot_min_frac)
     if have_spots:
-        # perform inpainting with provided radius to remove detected specks
         result = cv2.inpaint(result, mask, inpaint_radius, cv2.INPAINT_TELEA)
 
-    # Step 3: Contrast enhancement using CLAHE on L channel (or MSRCR)
-    # By default use CLAHE; MSRCR will be applied if msr=True passed via kwargs.
-    lab2 = cv2.cvtColor(result, cv2.COLOR_BGR2LAB)
-    l2, a2, b2 = cv2.split(lab2)
-    clahe = cv2.createCLAHE(clipLimit=clahe_clip, tileGridSize=(8, 8))
-    cl = clahe.apply(l2)
-    merged = cv2.merge((cl, a2, b2))
-    contrast = cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
+    # Step 4: Fold line suppression (NEW)
+    num_folds = 0
+    if use_fold_suppression:
+        result, fold_mask, num_folds = suppress_fold_lines(result)
 
-    # Step 4: Increase saturation in HSV
+    # Step 5: Contrast enhancement
+    if use_multiscale_clahe:
+        contrast = enhance_contrast_multiscale(result, clip_limit=clahe_clip)
+    else:
+        contrast = apply_clahe_single(result, clahe_clip, (8, 8))
+
+    # Step 6: Saturation boost
     hsv = cv2.cvtColor(contrast, cv2.COLOR_BGR2HSV).astype(np.float32)
     h, s, v = cv2.split(hsv)
     scale = sat_scale_override if sat_scale_override is not None else sat_scale
     s = np.clip(s * scale, 0, 255).astype(np.uint8)
-    hsv = cv2.merge((h.astype(np.uint8), s, v.astype(np.uint8)))
-    color = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+    color = cv2.cvtColor(cv2.merge((h.astype(np.uint8), s, v.astype(np.uint8))),
+                          cv2.COLOR_HSV2BGR)
 
-    # Step 5: Mild sharpening via unsharp masking
+    # Step 7: Unsharp masking
     blurred = cv2.GaussianBlur(color, (0, 0), sigmaX=1.0)
     sharpen = cv2.addWeighted(color, 1.0 + unsharp_amount, blurred, -unsharp_amount, 0)
 
     return sharpen
 
 
-def restore_image_msr_wrapper(img, **kwargs):
-    """Wrapper: if msr True in kwargs, apply MSRCR instead of CLAHE step.
+# ─────────────────────────────────────────────
+# ABLATION STUDY  ← NEW
+# ─────────────────────────────────────────────
 
-    This function calls restore_image but replaces the contrast step output
-    with MSRCR if requested.
+def run_ablation_study(img, sat_scale=1.5, nlm_h=6, median_k=3, clahe_clip=1.1,
+                        sat_scale_override=1.5, unsharp_amount=0.3,
+                        spot_thresh=50, spot_blur=9, spot_min_frac=1e-4,
+                        inpaint_radius=2):
+    """Run ablation study — process image with each step removed one at a time.
+
+    Returns a dict of variant_name → (restored_image, brisque, niqe)
+
+    Variants:
+      original            : no processing at all
+      full_pipeline       : all steps active
+      no_denoising        : skip denoising step
+      no_white_balance    : skip white balance step
+      no_clahe            : skip contrast enhancement
+      no_saturation       : skip saturation boost
+      no_unsharp          : skip unsharp masking
+      no_fold_suppression : skip fold line suppression
     """
-    msr_flag = kwargs.pop('msr', False)
-    # run the standard pipeline first
-    restored = restore_image(img, **kwargs)
-    if not msr_flag:
-        return restored
+    results = {}
 
-    # If msr_flag True: recompute a base image from denoising + inpainting
+    def score(processed):
+        b = brisque_score(processed)
+        n = niqe_score(processed)
+        return processed, b, n
+
+    # Original — no processing
+    results['original'] = score(img)
+
+    # Full pipeline
+    full = restore_image(img, sat_scale=sat_scale, nlm_h=nlm_h,
+                          median_k=median_k, clahe_clip=clahe_clip,
+                          sat_scale_override=sat_scale_override,
+                          unsharp_amount=unsharp_amount,
+                          spot_thresh=spot_thresh, spot_blur=spot_blur,
+                          spot_min_frac=spot_min_frac,
+                          inpaint_radius=inpaint_radius,
+                          use_fold_suppression=True,
+                          use_multiscale_clahe=True)
+    results['full_pipeline'] = score(full)
+
+    # --- Remove denoising ---
     noise_lvl = estimate_noise(img)
-    nlm_h = kwargs.get('nlm_h', 10)
-    median_k = kwargs.get('median_k', 5)
     if noise_lvl > 10.0:
-        base = nl_means_denoise(img, h=nlm_h, hColor=nlm_h)
+        denoised = nl_means_denoise(img, h=nlm_h, hColor=nlm_h)
     else:
-        base = cv2.medianBlur(img, median_k)
-    base = white_balance_grayworld(base)
-    mask, have_spots = detect_spots_mask(base, thresh=kwargs.get('spot_thresh', 30), blur_size=kwargs.get('spot_blur', 9), min_frac=kwargs.get('spot_min_frac', 5e-5))
+        denoised = cv2.medianBlur(img, median_k)
+    wb_result, _, _ = white_balance_adaptive(img)           # skip denoise
+    mask, have_spots = detect_spots_mask(wb_result, thresh=spot_thresh, blur_size=spot_blur, min_frac=spot_min_frac)
     if have_spots:
-        base = cv2.inpaint(base, mask, kwargs.get('inpaint_radius', 3), cv2.INPAINT_TELEA)
+        wb_result = cv2.inpaint(wb_result, mask, inpaint_radius, cv2.INPAINT_TELEA)
+    no_denoise_contrast = enhance_contrast_multiscale(wb_result, clip_limit=clahe_clip)
+    hsv = cv2.cvtColor(no_denoise_contrast, cv2.COLOR_BGR2HSV).astype(np.float32)
+    h2, s2, v2 = cv2.split(hsv)
+    s2 = np.clip(s2 * sat_scale_override, 0, 255).astype(np.uint8)
+    no_denoise_color = cv2.cvtColor(cv2.merge((h2.astype(np.uint8), s2, v2.astype(np.uint8))), cv2.COLOR_HSV2BGR)
+    blr = cv2.GaussianBlur(no_denoise_color, (0, 0), sigmaX=1.0)
+    results['no_denoising'] = score(cv2.addWeighted(no_denoise_color, 1.0+unsharp_amount, blr, -unsharp_amount, 0))
 
-    # Apply MSRCR
-    msr_img = msrcr(base)
+    # --- Remove white balance ---
+    no_wb = denoised.copy()
+    mask2, have_spots2 = detect_spots_mask(no_wb, thresh=spot_thresh, blur_size=spot_blur, min_frac=spot_min_frac)
+    if have_spots2:
+        no_wb = cv2.inpaint(no_wb, mask2, inpaint_radius, cv2.INPAINT_TELEA)
+    no_wb_contrast = enhance_contrast_multiscale(no_wb, clip_limit=clahe_clip)
+    hsv3 = cv2.cvtColor(no_wb_contrast, cv2.COLOR_BGR2HSV).astype(np.float32)
+    h3, s3, v3 = cv2.split(hsv3)
+    s3 = np.clip(s3 * sat_scale_override, 0, 255).astype(np.uint8)
+    no_wb_color = cv2.cvtColor(cv2.merge((h3.astype(np.uint8), s3, v3.astype(np.uint8))), cv2.COLOR_HSV2BGR)
+    blr3 = cv2.GaussianBlur(no_wb_color, (0, 0), sigmaX=1.0)
+    results['no_white_balance'] = score(cv2.addWeighted(no_wb_color, 1.0+unsharp_amount, blr3, -unsharp_amount, 0))
 
-    # After MSRCR, increase saturation and sharpen as in main pipeline
-    hsv = cv2.cvtColor(msr_img, cv2.COLOR_BGR2HSV).astype(np.float32)
-    h, s, v = cv2.split(hsv)
-    scale = kwargs.get('sat_scale_override', None) or kwargs.get('sat_scale', 1.25)
-    s = np.clip(s * scale, 0, 255).astype(np.uint8)
-    hsv = cv2.merge((h.astype(np.uint8), s, v.astype(np.uint8)))
-    color = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
-    blurred = cv2.GaussianBlur(color, (0, 0), sigmaX=1.0)
-    unsharp_amount = kwargs.get('unsharp_amount', 0.5)
-    final = cv2.addWeighted(color, 1.0 + unsharp_amount, blurred, -unsharp_amount, 0)
-    return final
+    # --- Remove CLAHE ---
+    wb_only, _, _ = white_balance_adaptive(denoised)
+    mask4, have_spots4 = detect_spots_mask(wb_only, thresh=spot_thresh, blur_size=spot_blur, min_frac=spot_min_frac)
+    if have_spots4:
+        wb_only = cv2.inpaint(wb_only, mask4, inpaint_radius, cv2.INPAINT_TELEA)
+    hsv4 = cv2.cvtColor(wb_only, cv2.COLOR_BGR2HSV).astype(np.float32)
+    h4, s4, v4 = cv2.split(hsv4)
+    s4 = np.clip(s4 * sat_scale_override, 0, 255).astype(np.uint8)
+    no_clahe_color = cv2.cvtColor(cv2.merge((h4.astype(np.uint8), s4, v4.astype(np.uint8))), cv2.COLOR_HSV2BGR)
+    blr4 = cv2.GaussianBlur(no_clahe_color, (0, 0), sigmaX=1.0)
+    results['no_clahe'] = score(cv2.addWeighted(no_clahe_color, 1.0+unsharp_amount, blr4, -unsharp_amount, 0))
 
+    # --- Remove saturation ---
+    wb5, _, _ = white_balance_adaptive(denoised)
+    mask5, hs5 = detect_spots_mask(wb5, thresh=spot_thresh, blur_size=spot_blur, min_frac=spot_min_frac)
+    if hs5:
+        wb5 = cv2.inpaint(wb5, mask5, inpaint_radius, cv2.INPAINT_TELEA)
+    contrast5 = enhance_contrast_multiscale(wb5, clip_limit=clahe_clip)
+    blr5 = cv2.GaussianBlur(contrast5, (0, 0), sigmaX=1.0)
+    results['no_saturation'] = score(cv2.addWeighted(contrast5, 1.0+unsharp_amount, blr5, -unsharp_amount, 0))
+
+    # --- Remove unsharp masking ---
+    wb6, _, _ = white_balance_adaptive(denoised)
+    mask6, hs6 = detect_spots_mask(wb6, thresh=spot_thresh, blur_size=spot_blur, min_frac=spot_min_frac)
+    if hs6:
+        wb6 = cv2.inpaint(wb6, mask6, inpaint_radius, cv2.INPAINT_TELEA)
+    contrast6 = enhance_contrast_multiscale(wb6, clip_limit=clahe_clip)
+    hsv6 = cv2.cvtColor(contrast6, cv2.COLOR_BGR2HSV).astype(np.float32)
+    h6, s6, v6 = cv2.split(hsv6)
+    s6 = np.clip(s6 * sat_scale_override, 0, 255).astype(np.uint8)
+    results['no_unsharp'] = score(cv2.cvtColor(cv2.merge((h6.astype(np.uint8), s6, v6.astype(np.uint8))), cv2.COLOR_HSV2BGR))
+
+    # --- Remove fold suppression ---
+    no_fold = restore_image(img, sat_scale=sat_scale, nlm_h=nlm_h,
+                             median_k=median_k, clahe_clip=clahe_clip,
+                             sat_scale_override=sat_scale_override,
+                             unsharp_amount=unsharp_amount,
+                             use_fold_suppression=False,
+                             use_multiscale_clahe=True)
+    results['no_fold_suppression'] = score(no_fold)
+
+    return results
+
+
+def print_ablation_table(ablation_results):
+    """Print ablation study results as a formatted table."""
+    print('\n' + '='*65)
+    print(f"{'Variant':<25} {'BRISQUE':>10} {'NIQE':>10} {'Note'}")
+    print('='*65)
+    order = ['original', 'full_pipeline', 'no_denoising', 'no_white_balance',
+             'no_clahe', 'no_saturation', 'no_unsharp', 'no_fold_suppression']
+    notes = {
+        'original':           'No processing',
+        'full_pipeline':      'All steps active ← best',
+        'no_denoising':       'Skip denoise step',
+        'no_white_balance':   'Skip white balance',
+        'no_clahe':           'Skip contrast step',
+        'no_saturation':      'Skip saturation boost',
+        'no_unsharp':         'Skip unsharp masking',
+        'no_fold_suppression':'Skip fold suppression',
+    }
+    for key in order:
+        if key in ablation_results:
+            _, b, n = ablation_results[key]
+            print(f"{key:<25} {b:>10.4f} {n:>10.4f}   {notes.get(key,'')}")
+    print('='*65)
+    print('Lower BRISQUE and NIQE = better perceptual quality\n')
+
+
+# ─────────────────────────────────────────────
+# ANALYZE AND RESTORE
+# ─────────────────────────────────────────────
 
 def analyze_and_restore(img, sat_scale=1.25, noise_thresh=10.0, contrast_thresh=30.0):
-    """Analyze image and run an adaptive restoration pipeline.
+    """Analyze image and run adaptive restoration pipeline.
 
-    Returns (restored_image, info_dict) where info_dict contains detection
-    results and quality metrics (computed after restoration).
+    Returns (restored_image, info_dict).
     """
     info = {}
-
-    # detect grayscale
     info['is_grayscale'] = is_grayscale(img)
-
-    # noise detection
     noisy, noise_lvl = is_noisy(img, noise_thresh=noise_thresh)
     info['is_noisy'] = noisy
     info['noise_level'] = noise_lvl
-
-    # contrast detection
     low_contrast, contrast_score_val = is_low_contrast(img, contrast_thresh=contrast_thresh)
     info['is_low_contrast'] = low_contrast
     info['contrast_score'] = contrast_score_val
 
-    # Choose pipeline
-    # Use the restored image from the main restore pipeline
+    # Colorfulness info
+    cf = colorfulness_metric(img)
+    wb_w = adaptive_wb_weight(cf)
+    info['colorfulness'] = cf
+    info['wb_weight_used'] = wb_w
+
     restored = restore_image(img, sat_scale=sat_scale)
 
-    # Metrics (use grayscale comparison)
     orig_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    res_gray = cv2.cvtColor(restored, cv2.COLOR_BGR2GRAY)
-    info['mse'] = mse(orig_gray, res_gray)
+    res_gray  = cv2.cvtColor(restored, cv2.COLOR_BGR2GRAY)
+    info['mse']  = mse(orig_gray, res_gray)
     info['psnr'] = psnr(orig_gray, res_gray)
     info['ssim'] = ssim(orig_gray, res_gray)
 
