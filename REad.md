@@ -1,266 +1,177 @@
-# 🖼️ Image Color Restoration — Photographic Conservation Toolkit
-
-[![Python](https://img.shields.io/badge/Python-3.8%2B-blue)](https://www.python.org/)
-[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Status](https://img.shields.io/badge/Status-Prototype-yellowgreen.svg)](#)
-[![Repo size](https://img.shields.io/badge/Size-compact-lightgrey.svg)](#)
-
-A concise, production-minded restoration pipeline for scanned historical photographs. The project focuses on recovering color, reducing film/scan noise, repairing small defects and folds, and producing natural, archival-quality results.
-
----
-
-## 📋 Table of Contents
-
-1. [Overview](#overview)
-2. [Quick Start](#quick-start)
-3. [Project Structure](#project-structure)
-4. [Pipeline Overview](#pipeline-overview)
-5. [Algorithms & Methods](#algorithms--methods)
-6. [Usage Examples](#usage-examples)
-7. [Parameter Tuning](#parameter-tuning)
-8. [Performance & Troubleshooting](#performance--troubleshooting)
-9. [Extensions & Roadmap](#extensions--roadmap)
-10. [Release Checklist](#release-checklist)
-
----
-
-## Overview
-
-This repository implements a classical, well-documented restoration pipeline for scanned historical images (JPG/PNG/TIFF). The code is deliberately dependency-light and intended for reproducible archival workflows.
-
-I/O
-- Input: `dataset/old_images/`
-- Output: `results/restored_images/` (restored_*, comparison_*, ablation_*)
-
-Quality metrics
-- Reference-based: MSE, PSNR, SSIM
-- No-reference: BRISQUE, NIQE (optional; requires `opencv-contrib-python`)
-
-Highlights
-- ✅ Non-Local Means denoising (adaptive strength)
-- ✅ Adaptive white balance guided by Hasler–Süsstrunk colorfulness metric
-- ✅ Spot/dust detection + Telea inpainting
-- ✅ Fold/crease suppression with Hough detection + directional inpainting
-- ✅ Multi-scale CLAHE (4×4, 8×8, 16×16) blended for natural contrast
-- ✅ Saturation and conservative unsharp masking tuned for archival tones
-- ✅ Ablation tooling to quantify each stage's impact (BRISQUE/NIQE)
-
----
-
-## Quick start
-
-Install dependencies and run the pipeline:
-
-```powershell
-python -m pip install -r requirements.txt
-python main.py
-```
-
-Options
-- `--no-display` — headless run (recommended for batch processing)
-- `--input-dir` / `--output-dir` — override locations
-- `--ablation` — save an 8-panel ablation grid comparing pipeline variants
- - `--preset` — choose `conservative`, `balanced`, or `aggressive` processing presets (see Parameters)
-
-New utilities
-- `benchmark.py` — simple per-step timing utility (run to measure CPU cost of each stage)
-
-All outputs are saved to `results/restored_images/`. Comparison images are written to disk to avoid GUI/memory issues on large images or headless servers.
-
----
-
-## Requirements
-
-Install core dependencies:
-
-```bash
-python -m pip install -r requirements.txt
-```
-
-Minimum: `opencv-python`, `numpy`, `matplotlib`.
-Optional for advanced metrics: `opencv-contrib-python` (BRISQUE/NIQE).
-
-The pipeline is CPU-friendly — GPU is optional and only relevant for future learned components.
-
----
-
-## Repository layout
-
-```
-image-color-restoration/
-├── main.py                 # CLI and batch orchestration
-├── restoration.py          # Core processing pipeline and helpers
-├── wiener_deblur.py        # Optional classical deblurring experiments (kept out of main pipeline)
-├── requirements.txt        # Python dependencies
-├── README.md               # Documentation
-├── dataset/                # Input images: dataset/old_images/
-└── results/                # Outputs: results/restored_images/
-```
-
----
-
-## Results and outputs
-
-Saved files (per image `name.ext`):
-
-- `restored_name.png` — final restored image
-- `comparison_name.png` — side-by-side original / restored
-- `ablation_name.png` — 8-panel ablation grid (if `--ablation`)
-
-Console logs show per-image analysis (colorfulness, noise estimate) and computed metrics when a reference is available.
-
----
-
-
-## Pipeline overview
-
-The pipeline is designed to be conservative and explainable. Steps (configurable in `restoration.py`):
-
-1. Analysis — compute noise estimate, contrast score and colorfulness.
-2. Denoise — Non-Local Means (adaptive `h`) or median fallback.
-3. Adaptive white balance — blend original + gray-world corrected using a colorfulness-driven weight.
-4. Spot/dust removal — residual thresholding → mask → Telea inpaint.
-5. Fold suppression — Hough line detection → create mask → directional smoothing + inpaint.
-6. Multi-scale CLAHE — apply CLAHE at tile sizes (4×4, 8×8, 16×16), then blend.
-7. Saturation & unsharp — conservative saturation boost and gentle unsharp mask.
-8. Metrics & save — compute MSE/PSNR/SSIM and BRISQUE/NIQE (optional) and save outputs.
-
-### Mermaid flow (maintained in-source)
-
-```mermaid
-flowchart TD
-    A["📸 Load image"] --> B["🔍 Analyze: noise / contrast / colorfulness"]
-    B --> C{Noise level high?}
-    C -->|Yes| D["🧹 Non-Local Means (adaptive)"]
-    C -->|No| E["🧹 Median Blur fallback"]
-    D --> F["🎨 Adaptive WB (colorfulness → weight)"]
-    E --> F
-    F --> G["🌟 Spot detection + Telea inpainting"]
-    G --> H["📐 Fold detection + directional inpaint"]
-    H --> I["🌗 Multi-scale CLAHE (4,8,16 tiles)"]
-    I --> J["🌈 Saturation boost + unsharp mask"]
-    J --> K["📊 Compute metrics + save outputs"]
-
-    style A fill:#e1f5ff
-    style K fill:#c8e6c9
-```
-
----
-
-## Algorithms & formulas
-
-Key formulas used in the repository (displayed for reviewers):
-
-- Hasler–Süsstrunk colorfulness (implementation uses channel differences):
-
-$$
-rg = R - G \qquad yb = 0.5(R + G) - B
-$$
-$$
-	ext{Colorfulness} = \sqrt{\sigma_{rg}^2 + \sigma_{yb}^2} + 0.3\,\sqrt{\mu_{rg}^2 + \mu_{yb}^2}
-$$
-
-- Mean Squared Error (MSE) and Peak Signal to Noise Ratio (PSNR):
-
-$$
-MSE = \frac{1}{WH} \sum_{x=1}^{W}\sum_{y=1}^{H} (I(x,y) - K(x,y))^2
-$$
-$$
-PSNR = 10 \log_{10}\left(\frac{MAX_I^2}{MSE}\right)
-$$
-
-- Notes on SSIM: SSIM is computed via the standard luminance/contrast/structure decomposition (see `skimage.metrics.structural_similarity`).
-
-Algorithmic notes
-- NLM denoising: `cv2.fastNlMeansDenoisingColored()` with adaptive `h` controlled by the estimated noise.
-- CLAHE: applied to the L channel (Lab colorspace) at three tile sizes; results are blended to avoid halos.
-- Fold suppression: Hough detection builds a thin mask (line thickness tuned) followed by local directional smoothing and inpainting.
-
-## Usage examples
-
-Standard run:
-
-```powershell
-python main.py
-```
-
-Ablation (no display):
-
-```powershell
-python main.py --ablation --no-display
-```
-
-Batch processing:
-
-```powershell
-python main.py --input-dir "D:\old_photos" --output-dir "D:\restored"
-```
-
-## Parameters and presets
-
-Default parameters are defined in `restoration.py`. Example presets (suggested):
-
-- `conservative` — minimal color shifts, low CLAHE, low unsharp (safe for archival)
-- `balanced` — default tuned values (recommended for general restoration)
-- `aggressive` — stronger saturation and contrast for visually dramatic results
-
-Example parameter table (defaults shown):
-
-| Parameter | Default | Notes |
-|---:|:---:|---|
-| `nlm_h` | 6 | Denoise strength (increase for grain)
-| `clahe_clip` | 1.1 | Local contrast clip limit
-| `sat_scale` | 1.5 | Saturation multiplier
-| `unsharp_amount` | 0.3 | Edge enhancement
-
-The codebase now includes a working `--preset` flag (see `main.py`) that maps to these configurations.
-To run an aggressive preset:
-
-```powershell
-python main.py --preset aggressive
-```
-
-To run the benchmark utility:
-
-```powershell
-python benchmark.py --input dataset/old_images/old.png --output results/benchmark.json --repeats 3
-```
-
-## Performance & troubleshooting
-
-- NLM denoising is the heaviest cost — for throughput reduce `nlm_h` or use the median fallback.
-- Use `--no-display` for headless servers and CI.
-- If fold suppression misses creases: lower `hough_thresh` and `min_line_length` in `restoration.py`.
-
-If you want, I can add a small benchmark script that measures per-step runtime on a sample image.
-
-## Extensions & roadmap
-
-- Replace NLM with learned denoisers (FFDNet, DnCNN) for extreme grain.
-- Add LaMa for large-mask inpainting (tears, large missing regions).
-- Add optional super-resolution (Real-ESRGAN) and learned colorization (DeOldify) as separate modules.
-
-## Release checklist
-
-- [x] Core restoration pipeline implemented
-- [x] Adaptive white balance and multi-scale CLAHE
-- [x] Fold suppression and spot inpainting
-- [x] Ablation tooling and metric collection
-- [ ] Add before/after sample images to `results/`
-- [ ] Add unit tests and CI
-
-## Credits
-
-Core dependencies: OpenCV, NumPy, Matplotlib.
-
-References: Buades et al. (NLM), Zuiderveld (CLAHE), Telea (inpainting), Hasler & Süsstrunk (colorfulness), Mittal et al. (BRISQUE/NIQE).
-
-**Last updated:** April 3, 2026
-
-Want this even more polished? I can:
-
-- add a small result gallery (`results/` images + markdown embeds)
-- implement the `--preset` flag with three preset configurations
-- add a lightweight benchmarking script and CI job
-
-Reply with which of the above you want next and I will implement it.
+What I changed
+
+restoration.py:
+Fold-line detection: detect_fold_lines(...) now returns per-line dicts with confidence, orientation, and thickness (estimates based on edge/gradient sampling).
+Fold mask building: build_fold_mask(...) uses per-line thickness and confidence.
+Fold suppression: suppress_fold_lines(...) applies orientation-aware smoothing, avoids strongly textured regions, refines the mask, then inpaints and blends.
+Spot detection: detect_spots_mask(...) now uses multi-scale median residuals and suppresses detections in textured areas.
+Spot inpainting: inpaint_spots(...) refines the mask before Telea inpainting and accepts inpaint_radius.
+How to run the updated modules
+
+
+
+
+9. Replace Heuristic Decisions with Continuous Adaptation
+Current problem: Your main.py uses hard if blur_level < 100 / < 200 / < 500 branches — abrupt jumps.
+Fix: Replace the 4 if/elif blocks in process_all() with a smooth interpolation function:# In main.py — replace the entire if/elif blur block with this:
+
+def compute_params_continuous(blur_level):
+    """Smoothly interpolate parameters based on blur level (no hard jumps)."""
+    # Normalize blur to 0-1 range (0=very blurry, 1=sharp)
+    sharpness = np.clip(blur_level / 500.0, 0.0, 1.0)
+
+    return dict(
+        nlm_h            = int(round(8 - 2 * sharpness)),     # 8 → 6
+        median_k         = 3,
+        clahe_clip       = round(1.5 - 0.4 * sharpness, 2),   # 1.5 → 1.1
+        sat_scale_override = 1.5,
+        unsharp_amount   = round(0.5 - 0.2 * sharpness, 2),   # 0.5 → 0.3
+        spot_thresh      = 40,
+        inpaint_radius   = 2,
+        use_fold_suppression  = True,
+        use_multiscale_clahe  = True,
+        use_deblur       = sharpness < 0.5,   # smooth cutoff at midpoint
+        use_adaptive_sharpen  = True,
+    )
+
+# Then call it:
+mild_params = compute_params_continuous(blur_level)
+mild_variant = restore_image(img_proc, sat_scale=1.5, **mild_params)
+
+10. Data-Driven Parameter Optimization
+Fix: Add an optimizer that searches for the best WB weight, CLAHE blend weights, and saturation scale using BRISQUE as the objective:
+# Add to restoration.py
+
+def optimize_parameters(img, search_space=None):
+    """
+    Grid search over key parameters using BRISQUE as objective.
+    Returns best params dict. Runs fast (~1-2 sec) on downscaled image.
+    """
+    if search_space is None:
+        search_space = {
+            'wb_weight':      [0.25, 0.40, 0.55, 0.70],
+            'sat_scale':      [1.2, 1.4, 1.6],
+            'clahe_clip':     [1.0, 1.2, 1.4],
+        }
+
+    best_score  = float('inf')
+    best_params = {}
+
+    for wb_w in search_space['wb_weight']:
+        for sat in search_space['sat_scale']:
+            for clip in search_space['clahe_clip']:
+                # Apply just these three steps (fast)
+                wb  = white_balance_grayworld(img)
+                res = cv2.addWeighted(img, 1-wb_w, wb, wb_w, 0)
+                res = enhance_contrast_multiscale(res, clip_limit=clip)
+                hsv = cv2.cvtColor(res, cv2.COLOR_BGR2HSV).astype(np.float32)
+                h, s, v = cv2.split(hsv)
+                s = np.clip(s * sat, 0, 255).astype(np.uint8)
+                res = cv2.cvtColor(
+                    cv2.merge([h.astype(np.uint8), s, v.astype(np.uint8)]),
+                    cv2.COLOR_HSV2BGR
+                )
+                score = brisque_score(res)
+                if score < best_score:
+                    best_score  = score
+                    best_params = {'wb_weight': wb_w,
+                                   'sat_scale': sat,
+                                   'clahe_clip': clip}
+
+    return best_params, best_score
+    Then use it in restore_image():
+    # In restore_image() — after Step 1 blur detection, add:
+opt_params, _ = optimize_parameters(img)
+# Override the fixed defaults with optimized values:
+sat_scale    = opt_params.get('sat_scale',  sat_scale)
+clahe_clip   = opt_params.get('clahe_clip', clahe_clip)
+# pass opt_params['wb_weight'] into white_balance_adaptive if needed
+
+11. Image Difficulty-Aware Processing
+Fix: Add a difficulty_score() function and use it to scale pipeline intensity:
+# Add to restoration.py
+
+def difficulty_score(img):
+    """
+    Returns (score, level) where:
+      score 0.0–0.33 → 'low'    (mild degradation)
+      score 0.33–0.66 → 'medium'
+      score 0.66–1.0  → 'severe'
+    """
+    noise_lvl     = estimate_noise(img)
+    contrast      = contrast_score(img)
+    blur_lvl, _   = detect_blur_level(img)
+    colorfulness  = colorfulness_metric(img)
+
+    # Normalize each signal to [0, 1] — higher = worse
+    noise_norm    = np.clip(noise_lvl / 30.0,   0, 1)
+    contrast_norm = np.clip(1 - contrast / 60.0, 0, 1)   # low contrast = high difficulty
+    blur_norm     = np.clip(1 - blur_lvl / 500.0, 0, 1)  # low sharpness = high difficulty
+    color_norm    = np.clip(1 - colorfulness / 50.0, 0, 1)
+
+    score = 0.3*noise_norm + 0.25*contrast_norm + 0.25*blur_norm + 0.20*color_norm
+    score = float(np.clip(score, 0, 1))
+
+    level = 'low' if score < 0.33 else ('medium' if score < 0.66 else 'severe')
+    return score, level
+
+
+def intensity_from_difficulty(level):
+    """Map difficulty level to pipeline intensity multipliers."""
+    presets = {
+        'low':    dict(nlm_h=5,  clahe_clip=1.0, sat_scale=1.3, unsharp_amount=0.2),
+        'medium': dict(nlm_h=7,  clahe_clip=1.2, sat_scale=1.5, unsharp_amount=0.35),
+        'severe': dict(nlm_h=10, clahe_clip=1.5, sat_scale=1.7, unsharp_amount=0.5),
+    }
+    return presets[level]
+    Use it in main.py:
+    # Replace mild_params block with:
+diff_score, diff_level = difficulty_score(img_proc)
+mild_params = intensity_from_difficulty(diff_level)
+logging.info('Difficulty: %.2f (%s)', diff_score, diff_level)
+mild_variant = restore_image(img_proc, **mild_params)
+
+
+12. Improved Noise Estimation
+Fix: Replace the simple estimate_noise() with patch-based + frequency-domain analysis:
+# In restoration.py — replace estimate_noise() with this:
+
+def estimate_noise_advanced(img):
+    """
+    Combines:
+    1. Patch-based local variance (spatial domain)
+    2. High-frequency energy via DFT (frequency domain)
+    Returns a single robust noise estimate.
+    """
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
+
+    # --- Method 1: Patch-based (local flat regions) ---
+    h, w   = gray.shape
+    ps     = 16   # patch size
+    variances = []
+    for y in range(0, h - ps, ps):
+        for x in range(0, w - ps, ps):
+            patch = gray[y:y+ps, x:x+ps]
+            # Only use flat patches (low local mean gradient)
+            gx = np.abs(np.diff(patch, axis=1)).mean()
+            gy = np.abs(np.diff(patch, axis=0)).mean()
+            if gx < 5.0 and gy < 5.0:       # flat region
+                variances.append(np.var(patch))
+
+    patch_noise = float(np.median(variances)) ** 0.5 if variances else 0.0
+
+    # --- Method 2: Frequency domain — high-freq energy ratio ---
+    dft   = np.fft.fft2(gray)
+    dft_s = np.fft.fftshift(dft)
+    mag   = np.abs(dft_s)
+    cy, cx = h // 2, w // 2
+    rh, rw = h // 6, w // 6   # inner (low-freq) region
+    low_mask       = np.zeros((h, w), bool)
+    low_mask[cy-rh:cy+rh, cx-rw:cx+rw] = True
+    low_energy  = mag[low_mask].sum()  + 1e-6
+    high_energy = mag[~low_mask].sum() + 1e-6
+    freq_noise  = float(high_energy / (low_energy + high_energy)) * 30.0
+
+    # Blend both estimates
+    combined = 0.6 * patch_noise + 0.4 * freq_noise
+    return float(combined)
