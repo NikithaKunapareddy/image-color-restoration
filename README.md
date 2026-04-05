@@ -1263,3 +1263,10 @@ $$L_\text{enh} = \tfrac{1}{3}(L_{4\times4} + L_{8\times8} + L_{16\times16})$$
 **Last Updated:** April 5, 2026
 
 <p align="center"><sub>© 2026 Nikitha Kunapareddy • https://github.com/NikithaKunapareddy/image-color-restoration</sub></p>
+---
+
+<p align="center">
+  <strong>✨ Thank you for exploring this historical photo restoration pipeline! ✨</strong><br>
+  <sub>Unleash the power of adaptive image processing — right from your desktop.</sub><br>
+  <sub>🌟 📸 Happy restoring! 🎨</sub>
+</p>
