@@ -1,0 +1,133 @@
+# Image Color Restoration Pipeline - Complete Flow
+
+## Flowchart
+
+```mermaid
+flowchart TD
+    A["📸 LOAD IMAGE"] --> B["🔀 MODE SELECTION<br/>(heuristic/cnn/hybrid/difficulty/legacy)"]
+    
+    B --> C{"CNN MODE?<br/>TensorFlow +<br/>model.h5 exists?"}
+    C -->|YES| D["🤖 CNN MODEL<br/>Neural Network<br/>Processing"]
+    C -->|NO| E["⚠️ FALLBACK<br/>to Heuristic"]
+    
+    D --> F["🔧 ADAPTIVE<br/>PREPROCESSING<br/>Boost Saturation<br/>CLAHE if Faded"]
+    E --> F
+    
+    F --> G["🔍 IMAGE ANALYSIS<br/>Blur · Noise<br/>Contrast · Colorfulness"]
+    
+    G --> H["📊 DIFFICULTY LEVEL<br/>Low / Medium / Severe"]
+    
+    H --> I["🔬 NOISE ESTIMATION<br/>Detect Type:<br/>Poisson or Mixed"]
+    
+    I --> J{"Noise Level<br/>High?"}
+    J -->|YES| K["🧹 NLM DENOISE<br/>Non-Local Means<br/>Adaptive h-value"]
+    J -->|NO| L["🧹 MEDIAN BLUR<br/>Light Fast<br/>Kernel=3"]
+    
+    K --> M["🎨 WHITE BALANCE<br/>Entropy-Based<br/>Weight 25-70%"]
+    L --> M
+    
+    M --> N["🌟 SPOT REMOVAL<br/>Residual Threshold<br/>Telea Inpainting"]
+    
+    N --> O["📐 FOLD SUPPRESSION<br/>Canny + Hough<br/>Detection ≥35%<br/>Bilateral + Blend"]
+    
+    O --> P["🌗 MULTI-SCALE CLAHE<br/>Optimize Contrast<br/>4×4 · 8×8 · 16×16"]
+    
+    P --> Q["🌈 SATURATION BOOST<br/>HSV S-Channel<br/>Optimize Vibrancy"]
+    
+    Q --> R["✨ SHARPENING<br/>Edge + High-Pass<br/>Adaptive Unsharp<br/>Mask Amount"]
+    
+    R --> S["📊 CALCULATE METRICS<br/>MSE · PSNR · SSIM<br/>BRISQUE · NIQE"]
+    
+    S --> T{"Quality Check<br/>SSIM > 0.35?<br/>PSNR > 15?"}
+    T -->|FAIL| U["⚠️ FAILURE CASE<br/>Log to File"]
+    T -->|PASS| V["💾 SAVE OUTPUTS<br/>Restored Image<br/>Comparison<br/>Ablation<br/>Debug Info"]
+    
+    U --> V
+    V --> W["✅ PROCESS COMPLETE"]
+    
+    style A fill:#e1f5ff,stroke:#01579b,color:#000
+    style B fill:#fff3e0,stroke:#e65100,color:#000
+    style D fill:#c8e6c9,stroke:#1b5e20,color:#000
+    style E fill:#ffcdd2,stroke:#b71c1c,color:#000
+    style F fill:#fff3e0,stroke:#e65100,color:#000
+    style G fill:#e0f7fa,stroke:#006064,color:#000
+    style H fill:#e0f7fa,stroke:#006064,color:#000
+    style I fill:#e0f7fa,stroke:#006064,color:#000
+    style K fill:#c8e6c9,stroke:#1b5e20,color:#000
+    style L fill:#c8e6c9,stroke:#1b5e20,color:#000
+    style M fill:#ffe0b2,stroke:#e65100,color:#000
+    style N fill:#f3e5f5,stroke:#4a148c,color:#000
+    style O fill:#fce4ec,stroke:#880e4f,color:#000
+    style P fill:#e8f5e9,stroke:#1b5e20,color:#000
+    style Q fill:#e8f5e9,stroke:#1b5e20,color:#000
+    style R fill:#fff9c4,stroke:#f57f17,color:#000
+    style S fill:#e3f2fd,stroke:#0d47a1,color:#000
+    style T fill:#ffecb3,stroke:#f57c00,color:#000
+    style U fill:#ffcdd2,stroke:#b71c1c,color:#000
+    style V fill:#f1f8e9,stroke:#33691e,color:#000
+    style W fill:#c8e6c9,stroke:#1b5e20,color:#000
+```
+
+---
+
+## Pipeline Stages Breakdown
+
+### 1️⃣ **Input & Mode Selection**
+- Load image file
+- Choose processing mode: heuristic, CNN, hybrid, difficulty-based, or legacy
+
+### 2️⃣ **CNN Check**
+- Verify TensorFlow is installed
+- Check if model.h5 exists
+- Fallback to heuristic if requirements not met
+
+### 3️⃣ **Preprocessing**
+- Adaptive saturation boost for faded images
+- CLAHE for low contrast
+- Detect degradation type
+
+### 4️⃣ **Analysis**
+- Measure blur, noise, contrast
+- Calculate colorfulness metrics
+- Assess difficulty level (low/medium/severe)
+
+### 5️⃣ **Noise Estimation**
+- Spatial patch analysis
+- Frequency DFT analysis
+- Detect Poisson or Mixed noise
+
+### 6️⃣ **Denoising**
+- NLM (Non-Local Means) if noise > threshold
+- Median blur for light noise
+- Adaptive parameters
+
+### 7️⃣ **Color Correction**
+- Entropy-based white balance
+- Adaptive weight (25-70%)
+- Faded images → strong correction
+- Vivid images → gentle correction
+
+### 8️⃣ **Restoration Steps**
+- Spot removal (Telea inpainting)
+- Fold suppression (Canny + Hough detection)
+- Multi-scale CLAHE (4×4, 8×8, 16×16)
+- Saturation boost (HSV S-channel)
+- Sharpening (unsharp mask)
+
+### 9️⃣ **Quality Metrics**
+- MSE, PSNR, SSIM
+- BRISQUE, NIQE scores
+
+### 🔟 **Quality Check & Output**
+- Pass: SSIM > 0.35, PSNR > 15
+- Fail: Log to failure_cases.txt
+- Save restored image, comparison, ablation
+
+---
+
+## Key Features
+✅ Fully adaptive pipeline  
+✅ Fallback mechanisms  
+✅ Multi-scale processing  
+✅ Comprehensive metrics  
+✅ Failure detection & logging
